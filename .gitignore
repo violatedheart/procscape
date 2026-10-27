@@ -1,0 +1,10 @@
+/target/
+/.idea/
+/.vscode/
+*.swp
+*.tmp
+*.log
+*.pid
+/config.toml
+/wallpaper.png
+/wallpaper-*.png

@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=ProcScape
+Comment=Turn running processes into a living wallpaper
+Exec=procscape-gui
+Icon=preferences-desktop-wallpaper
+Terminal=false
+Categories=Utility;DesktopSettings;
+StartupNotify=true
