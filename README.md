@@ -186,12 +186,15 @@ NFPM=/tmp/procscape-tools/nfpm python3 packaging/build-packages.py --format rpm
 # On Debian 13, use --format deb instead.
 ```
 
+The builder uses an isolated `target/packages` directory and remaps checkout, home, Cargo, and Rustup paths to neutral `/build/...` prefixes in release binaries. Before packaging, it checks both executables for personal home paths and known build-machine prefixes. `--skip-build` reuses only these package-build binaries and still performs the privacy check.
+
 The builder refuses to label a Fedora binary as a Debian package or vice versa. Packages contain `/usr/bin/procscape`, `/usr/bin/procscape-gui`, the desktop launcher, and a system-wide user service. They keep settings in the user's XDG directories.
 
 ## Development and checks
 
 ```sh
 cargo test
+python3 -m unittest discover -s tests -p 'test_*.py'
 cargo run -- snapshot --output /tmp/procscape.png
 ```
 

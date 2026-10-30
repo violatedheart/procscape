@@ -9,9 +9,9 @@ license: MIT
 section: graphics
 priority: optional
 contents:
-  - src: target/release/procscape
+  - src: target/packages/release/procscape
     dst: /usr/bin/procscape
-  - src: target/release/procscape-gui
+  - src: target/packages/release/procscape-gui
     dst: /usr/bin/procscape-gui
   - src: packaging/procscape.desktop
     dst: /usr/share/applications/procscape.desktop

@@ -40,6 +40,7 @@ jobs:
         run: |
           cargo fmt --check
           cargo test --locked --features gui
+          python3 -m unittest discover -s tests -p "test_*.py"
       - name: Fetch packaging tool
         run: python3 packaging/fetch-nfpm.py /tmp/procscape-tools
       - name: Build native installer
