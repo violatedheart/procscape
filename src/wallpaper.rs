@@ -1,7 +1,7 @@
 use crate::config::Config;
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
-use std::{fs, path::Path, process::Command};
+use std::{collections::BTreeMap, fs, path::Path, process::Command};
 
 #[derive(Serialize, Deserialize, Default)]
 struct Original {
@@ -10,6 +10,8 @@ struct Original {
     dark_uri: Option<String>,
     picture_options: Option<String>,
     xfce: Option<String>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    xfce_properties: BTreeMap<String, String>,
 }
 
 pub fn apply(data: &Path, image: &Path, _cfg: &Config) -> Result<()> {
@@ -25,19 +27,23 @@ pub fn apply(data: &Path, image: &Path, _cfg: &Config) -> Result<()> {
         || (desktop.is_empty() && which("gsettings"))
     {
         let path = data.join("original-wallpaper.json");
-        let original = if path.exists() {
-            serde_json::from_slice(&fs::read(&path)?)?
-        } else {
-            let o = Original {
-                backend: "gnome".into(),
-                uri: Some(get_gsetting("picture-uri")?),
-                dark_uri: get_gsetting("picture-uri-dark").ok(),
-                picture_options: get_gsetting("picture-options").ok(),
-                xfce: None,
-            };
-            fs::write(&path, serde_json::to_vec_pretty(&o)?)?;
-            o
-        };
+        let current_uri = get_gsetting("picture-uri")?;
+        let current_dark = get_gsetting("picture-uri-dark").ok();
+        let mut original = read_original(&path, "gnome")?;
+        let personal_light = !managed_image(data, &current_uri);
+        let personal_dark = current_dark
+            .as_ref()
+            .is_some_and(|v| !managed_image(data, v));
+        if personal_light {
+            original.uri = Some(current_uri);
+        }
+        if personal_dark {
+            original.dark_uri = current_dark;
+        }
+        if personal_light || personal_dark {
+            original.picture_options = get_gsetting("picture-options").ok();
+        }
+        save_original(&path, &original)?;
         let uri = format!(
             "file://{}",
             image.canonicalize()?.to_string_lossy().replace(' ', "%20")
@@ -47,7 +53,6 @@ pub fn apply(data: &Path, image: &Path, _cfg: &Config) -> Result<()> {
         }
         set_gsetting("picture-uri", &uri)?;
         let _ = set_gsetting("picture-uri-dark", &uri);
-        let _ = original;
         return Ok(());
     }
     anyhow::bail!(
@@ -82,38 +87,111 @@ fn set_gsetting(key: &str, uri: &str) -> Result<()> {
     }
     Ok(())
 }
-fn xfce_apply(data: &Path, image: &Path) -> Result<()> {
-    let key = "/backdrop/screen0/monitor0/workspace0/last-image";
-    let path = data.join("original-wallpaper.json");
-    if !path.exists() {
-        let old = Command::new("xfconf-query")
-            .args(["-c", "xfce4-desktop", "-p", key])
-            .output()
-            .ok()
-            .filter(|o| o.status.success())
-            .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string());
-        fs::write(
-            &path,
-            serde_json::to_vec(&Original {
-                backend: "xfce".into(),
-                uri: None,
-                dark_uri: None,
-                picture_options: None,
-                xfce: old,
-            })?,
-        )?;
-    }
+fn xfce_query(args: &[&str]) -> Result<String> {
     let out = Command::new("xfconf-query")
-        .args(["-c", "xfce4-desktop", "-p", key, "-s"])
-        .arg(image.canonicalize()?)
-        .output()?;
+        .args(["-c", "xfce4-desktop"])
+        .args(args)
+        .output()
+        .context("running xfconf-query")?;
     if !out.status.success() {
         anyhow::bail!(
-            "xfconf-query failed: {}",
-            String::from_utf8_lossy(&out.stderr)
-        )
+            "xfconf-query failed ({}): {}",
+            args.join(" "),
+            String::from_utf8_lossy(&out.stderr).trim()
+        );
+    }
+    Ok(String::from_utf8(out.stdout)?
+        .trim_end_matches(['\r', '\n'])
+        .to_string())
+}
+
+fn xfce_apply(data: &Path, image: &Path) -> Result<()> {
+    let image = image.canonicalize()?;
+    let listing = xfce_query(&["-l"])?;
+    let mut keys: Vec<_> = listing
+        .lines()
+        .filter(|key| key.starts_with("/backdrop/") && key.ends_with("/last-image"))
+        .collect();
+    // Older XFCE versions use image-path without a workspace component.
+    if keys.is_empty() {
+        keys = listing
+            .lines()
+            .filter(|key| key.starts_with("/backdrop/") && key.ends_with("/image-path"))
+            .collect();
+    }
+    if keys.is_empty() {
+        anyhow::bail!(
+            "no XFCE wallpaper properties found; open Desktop Settings and select a wallpaper first"
+        );
+    }
+    let path = data.join("original-wallpaper.json");
+    let mut original = read_original(&path, "xfce")?;
+    // Inspect all properties before changing any. Never replace a saved personal
+    // wallpaper with one of our own images, including after an upgrade/restart.
+    for key in &keys {
+        let current = xfce_query(&["-p", key])?;
+        if !managed_image(data, &current) {
+            original.xfce_properties.insert((*key).to_string(), current);
+        }
+    }
+    save_original(&path, &original)?;
+    for key in keys {
+        xfce_query(&["-p", key, "-s", &image.to_string_lossy()])?;
     }
     Ok(())
+}
+
+fn read_original(path: &Path, backend: &str) -> Result<Original> {
+    if path.exists() {
+        let original: Original = serde_json::from_slice(&fs::read(path)?)?;
+        if original.backend == backend {
+            return Ok(original);
+        }
+    }
+    Ok(Original {
+        backend: backend.into(),
+        ..Original::default()
+    })
+}
+
+fn save_original(path: &Path, original: &Original) -> Result<()> {
+    let temporary = path.with_extension("json.tmp");
+    fs::write(&temporary, serde_json::to_vec_pretty(original)?)?;
+    fs::rename(temporary, path)?;
+    Ok(())
+}
+
+fn managed_image(data: &Path, value: &str) -> bool {
+    let value = value.trim_matches('\'').trim_matches('"');
+    let decoded = value
+        .strip_prefix("file://")
+        .unwrap_or(value)
+        .replace("%20", " ");
+    let path = Path::new(&decoded);
+    let parent = path
+        .parent()
+        .map(|p| p.canonicalize().unwrap_or_else(|_| p.to_path_buf()));
+    let data = data.canonicalize().unwrap_or_else(|_| data.to_path_buf());
+    parent.as_deref() == Some(data.as_path())
+        && path.file_name().and_then(|n| n.to_str()).is_some_and(|n| {
+            n == "wallpaper.png" || (n.starts_with("wallpaper-") && n.ends_with(".png"))
+        })
+}
+
+/// Serialize desktop mutations across the daemon and foreground controls.
+/// Closing the file releases the advisory lock even if a process exits early.
+pub fn lock(data: &Path) -> Result<fs::File> {
+    use std::os::fd::AsRawFd;
+    let file = fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(data.join("wallpaper.lock"))?;
+    if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) } != 0 {
+        return Err(std::io::Error::last_os_error().into());
+    }
+    Ok(file)
 }
 
 pub fn restore(data: &Path) -> Result<()> {
@@ -136,17 +214,20 @@ pub fn restore(data: &Path) -> Result<()> {
             }
         }
         "xfce" => {
-            if let Some(v) = o.xfce {
-                let _ = Command::new("xfconf-query")
-                    .args([
-                        "-c",
-                        "xfce4-desktop",
+            if o.xfce_properties.is_empty() {
+                // Keep restoration compatible with snapshots from older releases.
+                if let Some(value) = o.xfce {
+                    xfce_query(&[
                         "-p",
                         "/backdrop/screen0/monitor0/workspace0/last-image",
                         "-s",
-                        &v,
-                    ])
-                    .status();
+                        &value,
+                    ])?;
+                }
+            } else {
+                for (key, value) in o.xfce_properties {
+                    xfce_query(&["-p", &key, "-s", &value])?;
+                }
             }
         }
         _ => anyhow::bail!("unknown saved wallpaper backend"),

@@ -8,3 +8,6 @@
 /config.toml
 /wallpaper.png
 /wallpaper-*.png
+
+/dist/
+__pycache__/

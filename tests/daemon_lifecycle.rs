@@ -50,7 +50,12 @@ fn daemon_can_start_pause_resume_and_stop() {
     .unwrap();
     let bin = Path::new(env!("CARGO_BIN_EXE_procscape"));
 
-    assert!(call(bin, &["start"], root).status.success());
+    let started = call(bin, &["start"], root);
+    assert!(
+        started.status.success(),
+        "{}",
+        String::from_utf8_lossy(&started.stderr)
+    );
     assert!(
         wait_for(bin, root, "running (PID", Duration::from_secs(5)),
         "daemon failed to start"
@@ -70,4 +75,22 @@ fn daemon_can_start_pause_resume_and_stop() {
         wait_for(bin, root, "stopped", Duration::from_secs(10)),
         "daemon failed to stop"
     );
+}
+
+#[test]
+fn invalid_configuration_fails_start_instead_of_reporting_success() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path();
+    fs::create_dir_all(root.join("config/procscape")).unwrap();
+    fs::write(
+        root.join("config/procscape/config.toml"),
+        "not valid = [toml",
+    )
+    .unwrap();
+    let bin = Path::new(env!("CARGO_BIN_EXE_procscape"));
+    let output = call(bin, &["start"], root);
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("failed to start"));
+    assert!(!root.join("runtime/procscape/control.sock").exists());
+    assert!(!root.join("runtime/procscape/daemon.pid").exists());
 }

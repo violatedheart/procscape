@@ -1,0 +1,125 @@
+name: Linux packages
+on:
+  push:
+    tags: ['v*']
+  pull_request:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  packages:
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - image: fedora:44
+            format: rpm
+            distro: fedora44
+          - image: debian:13
+            format: deb
+            distro: debian13
+    container: ${{ matrix.image }}
+    env:
+      PACKAGE_FORMAT: ${{ matrix.format }}
+      NFPM: /tmp/procscape-tools/nfpm
+    steps:
+      - name: Install build dependencies
+        shell: bash
+        run: |
+          if command -v dnf >/dev/null; then
+            dnf install -y git cargo rust rustfmt gcc pkgconf-pkg-config gtk4-devel dejavu-sans-fonts python3 tar gzip curl
+          else
+            apt-get update
+            apt-get install -y git cargo rustc rustfmt build-essential pkg-config libgtk-4-dev fonts-dejavu-core python3 tar gzip curl ca-certificates
+          fi
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - name: Validate and test
+        run: |
+          cargo fmt --check
+          cargo test --locked --features gui
+      - name: Fetch packaging tool
+        run: python3 packaging/fetch-nfpm.py /tmp/procscape-tools
+      - name: Build native installer
+        run: python3 packaging/build-packages.py --format "$PACKAGE_FORMAT"
+      - name: Inspect package contents and dependencies
+        shell: bash
+        run: |
+          if [ "$PACKAGE_FORMAT" = rpm ]; then
+            rpm -qip dist/*.rpm
+            rpm -qlp dist/*.rpm
+            rpm -qp --requires dist/*.rpm
+          else
+            dpkg-deb --info dist/*.deb
+            dpkg-deb --contents dist/*.deb
+          fi
+      - uses: actions/upload-artifact@v7
+        with:
+          name: procscape-${{ matrix.distro }}
+          path: dist/*
+          if-no-files-found: error
+  smoke:
+    needs: packages
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - image: fedora:44
+            distro: fedora44
+          - image: debian:13
+            distro: debian13
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          name: procscape-${{ matrix.distro }}
+          path: dist
+      - name: Install in a clean runtime container
+        env:
+          RUNTIME_IMAGE: ${{ matrix.image }}
+        run: |
+          docker run --rm -v "$PWD/dist:/packages:ro" "$RUNTIME_IMAGE" sh -ec '
+            if command -v dnf >/dev/null; then
+              dnf install -y /packages/*.rpm
+            else
+              apt-get update
+              apt-get install -y /packages/*.deb
+            fi
+            procscape --version
+            ldd /usr/bin/procscape-gui > /tmp/linked-libraries
+            cat /tmp/linked-libraries
+            ! grep -q "not found" /tmp/linked-libraries
+            test -f /usr/share/applications/procscape.desktop
+            grep -q "ExecStart=/usr/bin/procscape" /usr/lib/systemd/user/procscape.service
+          '
+  release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [packages, smoke]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: procscape-*
+          path: dist
+          merge-multiple: true
+      - name: Collect checksums
+        run: cat dist/*.sha256 > dist/SHA256SUMS
+      - name: Create draft release with installers
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RELEASE_TAG: ${{ github.ref_name }}
+        shell: bash
+        run: |
+          if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
+            test "$(gh release view "$RELEASE_TAG" --json isDraft --jq .isDraft)" = true
+            gh release upload "$RELEASE_TAG" dist/*.rpm dist/*.deb dist/SHA256SUMS --clobber
+          else
+            gh release create "$RELEASE_TAG" dist/*.rpm dist/*.deb dist/SHA256SUMS \
+              --verify-tag --draft --title "ProcScape $RELEASE_TAG" \
+              --notes 'Linux x86_64 installers for Fedora 44 and Debian 13. Install with dnf or apt, then open ProcScape from your application menu. No Rust toolchain is needed. Verify downloads with SHA256SUMS. Open the app to start updates; packages do not change your wallpaper during installation.'
+          fi
