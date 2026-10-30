@@ -107,7 +107,6 @@ fn build(app: &Application) {
     let preview = Picture::new();
     preview.set_size_request(740, 390);
     preview.set_can_shrink(true);
-    preview.set_content_fit(gtk4::ContentFit::Contain);
     let _ = fs::create_dir_all(data_path());
     let image = data_path().join("wallpaper.png");
     let active_image = fs::read_to_string(data_path().join("active-wallpaper.txt"))
@@ -116,7 +115,7 @@ fn build(app: &Application) {
         .filter(|path| path.exists())
         .unwrap_or_else(|| image.clone());
     if active_image.exists() {
-        preview.set_filename(Some(&active_image.to_string_lossy()));
+        preview.set_filename(Some(active_image.as_path()));
     }
     root.append(&preview);
 
@@ -147,7 +146,7 @@ fn build(app: &Application) {
         let _ = invoke(&["refresh"]);
         let _ = invoke(&["snapshot"]);
         if refresh_image.exists() {
-            picture.set_filename(Some(&refresh_image.to_string_lossy()));
+            picture.set_filename(Some(refresh_image.as_path()));
         }
         result.set_text("Wallpaper refreshed. Process metrics continue to update below.");
     });
@@ -359,7 +358,7 @@ fn build(app: &Application) {
             let _ = invoke(&["refresh"]);
             let _ = invoke(&["snapshot"]);
             if preview_image.exists() {
-                picture.set_filename(Some(&preview_image.to_string_lossy()));
+                picture.set_filename(Some(preview_image.as_path()));
             }
             result.set_text("Settings saved. Wallpaper refresh requested.");
         }
@@ -701,3 +700,4 @@ fn mode_name() -> String {
         .map(|c| format!("{:?}", c.mode))
         .unwrap_or_else(|| "Hybrid".into())
 }
+
