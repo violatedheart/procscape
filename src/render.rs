@@ -48,8 +48,9 @@ pub fn generate(snapshot: &Snapshot, cfg: &Config, out: &Path, state_path: &Path
     let mut seed = 1_u64;
     for p in ranked {
         let fraction = (p.weight / max_weight).clamp(0.0, 1.0);
-        let font_size =
-            cfg.min_font_size + (cfg.max_font_size - cfg.min_font_size) * (fraction.sqrt());
+        let target_size =
+            cfg.min_font_size + (cfg.max_font_size - cfg.min_font_size) * fraction.sqrt();
+        let font_size = smoothed_size(state.font_sizes.get(&p.key).copied(), target_size, cfg);
         let (tw, th) = text_bounds(&font, &p.name, font_size);
         let rotate = state.positions.get(&p.key).map(|x| x.2).unwrap_or_else(|| {
             seed = hash(&p.key);
@@ -130,6 +131,10 @@ pub fn generate(snapshot: &Snapshot, cfg: &Config, out: &Path, state_path: &Path
         .with_context(|| format!("saving PNG {}", out.display()))?;
     state.width = width;
     state.height = height;
+    state.font_sizes = sizes
+        .into_iter()
+        .filter(|(key, _)| next.contains_key(key))
+        .collect();
     state.positions = next;
     if let Some(parent) = state_path.parent() {
         fs::create_dir_all(parent)?;
@@ -150,6 +155,18 @@ pub fn generate(snapshot: &Snapshot, cfg: &Config, out: &Path, state_path: &Path
     }
     Ok(())
 }
+fn smoothed_size(previous: Option<f32>, target: f32, cfg: &Config) -> f32 {
+    let target = target.clamp(cfg.min_font_size, cfg.max_font_size);
+    let Some(previous) = previous.filter(|v| v.is_finite()) else {
+        return target;
+    };
+    let previous = previous.clamp(cfg.min_font_size, cfg.max_font_size);
+    if (target - previous).abs() < 0.5 {
+        return previous;
+    }
+    previous + (target - previous) * cfg.smoothing.clamp(0.01, 1.0)
+}
+
 fn dimensions(c: &Config) -> (u32, u32) {
     if c.width > 0 && c.height > 0 {
         return (c.width.min(7680), c.height.min(4320));
@@ -217,6 +234,20 @@ fn parse_geometry(s: &str) -> Option<(i32, i32, i32, i32)> {
     }
 }
 fn load_font(path: &str) -> Result<FontArc> {
+    // Existing configs contain Debian's font path. Resolve that default on
+    // other distributions too, while keeping explicit custom paths strict.
+    let path = if path == crate::config::DEFAULT_FONT_PATH && !Path::new(path).is_file() {
+        [
+            "/usr/share/fonts/dejavu-sans-fonts/DejaVuSans-Bold.ttf",
+            "/usr/share/fonts/TTF/DejaVuSans-Bold.ttf",
+            "/usr/share/fonts/dejavu/DejaVuSans-Bold.ttf",
+        ]
+        .into_iter()
+        .find(|candidate| Path::new(candidate).is_file())
+        .unwrap_or(path)
+    } else {
+        path
+    };
     let data = fs::read(path)
         .with_context(|| format!("reading font {path}; set font_path in config.toml"))?;
     FontArc::try_from_vec(data).map_err(|_| anyhow::anyhow!("invalid font file: {path}"))
@@ -343,6 +374,42 @@ fn load_layout(path: &Path) -> LayoutMemory {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn font_size_changes_gradually_and_respects_new_bounds() {
+        let cfg = Config {
+            smoothing: 0.25,
+            ..Config::default()
+        };
+        assert_eq!(smoothed_size(Some(100.0), 20.0, &cfg), 80.0);
+        assert_eq!(smoothed_size(Some(20.0), 100.0, &cfg), 40.0);
+        assert_eq!(smoothed_size(None, 100.0, &cfg), 100.0);
+        let smaller = Config {
+            max_font_size: 30.0,
+            ..cfg
+        };
+        assert!(smoothed_size(Some(100.0), 20.0, &smaller) <= 30.0);
+    }
+
+    #[test]
+    fn font_size_ignores_subpixel_jitter_and_legacy_state_loads() {
+        assert_eq!(smoothed_size(Some(30.0), 30.2, &Config::default()), 30.0);
+        let state: LayoutMemory = serde_json::from_str(
+            r#"{"width":800,"height":450,"positions":{"worker":[0.5,0.5,false]}}"#,
+        )
+        .unwrap();
+        assert!(state.font_sizes.is_empty());
+        assert!(state.positions.contains_key("worker"));
+    }
+
+    #[test]
+    fn default_font_loads_on_supported_distributions() {
+        load_font(&Config::default().font_path).unwrap();
+    }
+    #[test]
+    fn missing_custom_font_reports_configured_path() {
+        let error = load_font("/procscape-missing/custom.ttf").err().unwrap();
+        assert!(error.to_string().contains("/procscape-missing/custom.ttf"));
+    }
     #[test]
     fn color_hash_is_stable() {
         assert_eq!(hash("python3"), hash("python3"));

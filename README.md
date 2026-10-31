@@ -2,84 +2,140 @@
 
 ProcScape turns the processes visible to the current Linux user into a colorful, periodically refreshed word-cloud wallpaper. It is a native Rust application: process data comes from `/proc`, text is rasterized to PNG, and the GUI is an optional GTK 4 application.
 
-## Status
-
-This repository contains the sampler, weight calculation, deterministic themes, spiral placement and PNG renderer, GNOME/XFCE wallpaper integration, CLI/daemon, systemd user unit, and GTK dashboard with live metrics and process/appearance controls. The CLI and full non-GUI pipeline build and pass tests in Kali WSL. A real-process wallpaper was generated there and is shown below. WSL does not expose GNOME/XFCE wallpaper settings, and its GTK development libraries are not installed, so the GTK binary and desktop application remain unverified in this environment. Fedora GNOME is the intended desktop target for the installation steps below; a Fedora desktop run is still needed to verify GUI compilation and wallpaper application.
-
-The reference image is the intended visual direction: varied type sizes, sparse vertical words, dense composition, and colorful text on a dark background. ProcScape uses real process names and resource values only. The WSL session exposed just 17 eligible processes, so this genuine sample is less dense than the supplied desktop reference.
-
 ![ProcScape generated from live WSL processes](outputs/procscape-wsl.png)
 
-## Build on Debian 13
+## Downloadable installers
 
-Install Rust stable, a C toolchain, and GTK development files for the optional GUI:
+Release packages support **Fedora 44 x86_64** and **Debian 13 x86_64**. Download the matching package from [GitHub Releases](https://github.com/violatedheart/procscape/releases), then install it from your Downloads folder:
 
 ```sh
-sudo apt install build-essential pkg-config libgtk-4-dev fonts-dejavu-core
-cargo build --release
-cargo build --release --features gui --bin procscape-gui
+# Fedora
+sudo dnf install ./procscape_*_fedora44_x86_64.rpm
+
+# Debian 13
+sudo apt install ./procscape_*_debian13_x86_64.deb
 ```
 
-The CLI build does not require GTK. For a first snapshot:
+Open **ProcScape** from your application menu and choose **Start / resume**. Enable **Start on login** in the app's settings if you want automatic startup. Packages install the runtime dependencies; Rust and GTK development files are not needed. Installation does not change your wallpaper or automatically start the service.
+
+Packages become available after a maintainer runs the release workflow and publishes its draft release. If no package is available yet, use the source installation below. Download `SHA256SUMS` alongside the installers and run `sha256sum -c SHA256SUMS --ignore-missing` in that folder to verify the files you downloaded.
+
+If you previously installed from source, run `sh packaging/uninstall.sh` from that checkout before installing a package, so an old user launcher or service does not override the system installation. Saved settings and personal wallpaper backups are kept.
+
+## Install from source
+
+ProcScape supports Linux desktops running **GNOME or XFCE**, with a systemd user session. Building from source requires Rust 1.85 or newer. The Fedora 44 Xfce build, dashboard launch, and wallpaper application have been checked; GNOME desktop behavior and physical multi-monitor appearance still need verification.
+
+### 1. Install dependencies
+
+Choose the command for your distribution. This step only needs to be done once.
+
+**Fedora:**
 
 ```sh
-./target/release/procscape snapshot --output /tmp/procscape.png
+sudo dnf install git cargo rust gcc pkgconf-pkg-config gtk4-devel dejavu-sans-fonts
 ```
 
-## Install on Fedora Workstation with GNOME
-
-Install the compiler, GTK 4 development files, pkg-config compatibility, and the default font:
+**Debian 13:**
 
 ```sh
-sudo dnf install cargo rust gcc pkgconf-pkg-config gtk4-devel dejavu-sans-fonts
+sudo apt update
+sudo apt install git cargo rustc build-essential pkg-config libgtk-4-dev fonts-dejavu-core
 ```
 
-Build and run the GTK app from the project directory:
+Package references: [Fedora GTK development files](https://packages.fedoraproject.org/pkgs/gtk4/gtk4-devel/), [Fedora pkg-config](https://packages.fedoraproject.org/pkgs/pkgconf/), and [Debian GTK development files](https://packages.debian.org/trixie/libgtk-4-dev).
+
+### 2. Install ProcScape
 
 ```sh
-cargo build --release --bin procscape
-cargo build --release --features gui --bin procscape-gui
-cargo run --release --features gui --bin procscape-gui
+git clone https://github.com/violatedheart/procscape.git
+cd procscape
+sh packaging/install.sh --start
 ```
 
-To install the CLI, dashboard launcher, and user service into your home directory:
+The installer builds both binaries, adds ProcScape to your application menu, and enables wallpaper updates now and at login. The first build may take a few minutes. Run the installer as your regular desktop user.
+
+Already have this repository downloaded? Run just `sh packaging/install.sh --start` from the project directory. There is no separate Cargo build step.
+
+To install without enabling updates, omit `--start`. You can start updates from the app later. Run `sh packaging/install.sh --help` to see the options.
+
+### 3. Open ProcScape
+
+Find **ProcScape** in your application menu. No terminal PATH setup is needed to open it.
+
+- **Start / resume** starts wallpaper updates, every 15 seconds by default.
+- Choose a theme, sizing mode, and refresh interval, then scroll down to **Save settings and refresh**.
+- **Restore my wallpaper** pauses updates and restores your personal wallpaper in one click. Updates stay paused across service restarts and login until you choose **Start / resume**.
+- To change your personal wallpaper, restore it first, select a new image in your desktop settings, and resume ProcScape when ready. The next update remembers that image for future restores.
+
+The dashboard stays responsive while commands run in background tasks. Its preview follows the exact image last applied by the service, updates automatically, and clears when you restore your personal wallpaper. The dashboard shows **Running**, **Paused**, or **Stopped**, the last successful update, and any update error. Errors clear after the next successful update. Closing the dashboard keeps the current service state.
+
+## Smoother refreshes
+
+Existing names keep their previous positions whenever their updated bounds still fit. Font sizes use the **Smoothing** control across refreshes and daemon restarts; lower values make size changes more gradual. Unchanged snapshots render identically instead of slowly drifting.
+
+**Refresh fade (seconds; 0 = off)** controls a short crossfade between applied wallpapers. The default is **0.6 seconds**, adjustable up to 2 seconds. Set it to zero for immediate updates. In the TOML configuration, this is `transition_ms = 600`.
+
+The fade uses a short sequence of blended PNG images through the existing desktop wallpaper backend. Its fluidity depends on how quickly the desktop reloads images. The first image, identical images, resolution changes, and images above roughly 4K skip the fade. Your personal wallpaper backup is preserved throughout the transition.
+
+## Optional terminal commands
+
+For the default installation, make the CLI available in your current terminal:
 
 ```sh
-sh packaging/install.sh
-systemctl --user enable --now procscape.service
+export PATH="$HOME/.cargo/bin:$PATH"
 ```
 
-Open **ProcScape** from the application grid, or run `procscape start`. The background service updates the GNOME wallpaper every 15 seconds by default. Use `procscape pause`, `procscape resume`, `procscape refresh`, and `procscape restore` to control updates and restore the wallpaper that was active before ProcScape. The service uses GNOME's wallpaper settings and does not create an always-on-top desktop window, including on Wayland.
-
-To build just the CLI, omit `--features gui`; GTK development libraries are only needed for the dashboard. Fedora package names are listed by Fedora's package catalog for [`gtk4-devel`](https://packages.fedoraproject.org/pkgs/gtk4/gtk4-devel/), [`pkgconf-pkg-config`](https://packages.fedoraproject.org/pkgs/pkgconf/pkgconf-pkg-config/), and [`dejavu-sans-fonts`](https://packages.fedoraproject.org/pkgs/dejavu-fonts/dejavu-sans-fonts/).
-
-The wallpaper image and state are stored under `$XDG_DATA_HOME/procscape` (normally `~/.local/share/procscape`). A one-off snapshot defaults to `wallpaper.png`; the daemon uses uniquely named images and retains the latest three so GNOME sees a changed URI and can load it before older files are cleaned up. Configuration is created at `$XDG_CONFIG_HOME/procscape/config.toml` (normally `~/.config/procscape/config.toml`). Run `procscape config` to create it and print its path.
-
-## Run
+Add that line to your shell configuration (`~/.zshrc` for zsh or `~/.bashrc` for bash) for future terminals. If you set `CARGO_INSTALL_ROOT` or `CARGO_HOME`, use that installation's `bin` directory instead. The desktop launcher and service use absolute paths and work without this step.
 
 ```sh
-procscape snapshot --output ~/Pictures/procscape.png
-procscape start
 procscape status
+procscape restore
+procscape start
 procscape pause
 procscape resume
 procscape refresh
 procscape stop
-procscape restore
-procscape metrics
+procscape snapshot --output ~/Pictures/procscape.png
 ```
 
-`snapshot` samples twice 180 ms apart so CPU sizing is meaningful even when the daemon is not running. `start` launches the user daemon, which writes and applies a fresh wallpaper every 15 seconds by default. `stop` stops the service and leaves the generated wallpaper active. `restore` restores the wallpaper values recorded before ProcScape first applied its image. The original settings snapshot remains in the data directory for inspection.
+`restore` pauses updates before restoring your saved wallpaper. `start` starts or resumes the daemon; `stop` stops it and leaves the current wallpaper active. `snapshot` only generates a PNG without changing your desktop. Service commands use individual request/reply connections; success means the daemon has completed the requested action. Refresh while paused reports that you need to resume first. `start` verifies that the daemon is ready instead of assuming startup succeeded. For scripts and diagnostics, use `procscape status --json` (including the applied image path) and `procscape metrics`.
 
-To use the GTK dashboard, build with `--features gui --bin procscape-gui` and run `procscape-gui`. The dashboard can start/pause the daemon, request a refresh, restore the prior wallpaper, and save a small set of appearance controls. Closing the window does not stop the daemon.
-
-The install helper runs `cargo install --path . --features gui`, installs the desktop launcher, and writes a systemd user service. This GUI installation requires the GTK 4 development libraries above. Enable it at login with:
+To disable automatic startup and stop the installed service:
 
 ```sh
-systemctl --user enable --now procscape.service
+systemctl --user disable --now procscape.service
 ```
 
-The service uses the same daemon as `procscape start`; don't run both at once. See `packaging/uninstall.sh` to remove the binaries and launchers. It leaves saved settings and wallpaper files in place.
+To remove the installation, run this from the repository. Saved configuration and wallpaper files are kept:
+
+```sh
+sh packaging/uninstall.sh
+```
+
+## Configuration
+
+Configuration is created at `$XDG_CONFIG_HOME/procscape/config.toml` (normally `~/.config/procscape/config.toml`). Run `procscape config` to create it and print its path. See `configs/config.example.toml` for all settings.
+
+Wallpaper images and state live under `$XDG_DATA_HOME/procscape` (normally `~/.local/share/procscape`). The daemon uses uniquely named images and retains the latest three so the desktop sees a changed image path. A snapshot without `--output` writes `wallpaper.png` there.
+
+The default DejaVu Sans Bold font is resolved from standard Debian, Fedora, or Arch installation paths. A custom `font_path` must point to an existing font file.
+
+## Build without installing
+
+For development, build both the CLI and dashboard:
+
+```sh
+cargo build --locked --release --features gui --bins
+./target/release/procscape-gui
+```
+
+To build only the CLI, GTK development files are not required:
+
+```sh
+cargo build --locked --release --bin procscape
+./target/release/procscape snapshot --output /tmp/procscape.png
+```
 
 ## What it does
 
@@ -104,16 +160,41 @@ Themes: `catppuccin-mocha`, `catppuccin-latte`, `terminal-green`, `cyberpunk`, `
 
 ## Desktop integration and limits
 
-GNOME is updated through its supported GSettings background keys (`picture-uri` and `picture-uri-dark`). This is a periodic snapshot approach, not a live desktop surface or GNOME Shell extension. Wayland is supported through wallpaper settings only; ProcScape does not create a desktop window. On X11, `xrandr` geometry can be used to render one wallpaper spanning the detected monitors; separate per-monitor images are not generated. XFCE uses the standard `xfconf-query` background property for the first monitor/workspace. Other desktop environments are not currently supported.
+GNOME is updated through its supported GSettings background keys (`picture-uri` and `picture-uri-dark`). This is a periodic snapshot approach, not a live desktop surface or GNOME Shell extension. Wayland is supported through wallpaper settings only; ProcScape does not create a desktop window. On X11, `xrandr` geometry can be used to render one wallpaper spanning the detected monitors; separate per-monitor images are not generated. XFCE discovers existing `last-image` properties through `xfconf-query` and updates each configured monitor/workspace. Older XFCE `image-path` properties are used when no workspace properties exist. Other desktop environments are not currently supported.
 
-Wallpaper restoration captures GNOME's light/dark URI or the first XFCE workspace image before the first replacement. ProcScape changes the URI to a persistent versioned file in its data directory, avoiding same-path image cache issues. GNOME visual behavior and how each desktop applies multi-monitor settings still needs verification on the user's session.
+Wallpaper restoration remembers GNOME's light/dark URI or every discovered XFCE wallpaper property before replacing it. To change your personal wallpaper, click **Restore my wallpaper**, choose a new image in your desktop settings, then click **Start / resume** when you want ProcScape again. The next wallpaper update remembers that new personal image, and subsequent restores return to it. Generated ProcScape images never replace the saved personal wallpaper, including across restarts. Separate GNOME light/dark values and XFCE monitor/workspace values are preserved independently. ProcScape changes the URI to a persistent versioned file in its data directory, avoiding same-path image cache issues. GNOME visual behavior and how each desktop applies multi-monitor settings still needs verification on the user's session.
 
-The GTK dashboard provides live process/CPU/memory summaries, a top-process list, service controls, theme/mode/interval selection, sizing and smoothing controls, process-name search/exclusions/pinning, user-only and process-group filters, thresholds, font/colors, and output dimensions. GNOME spanning uses detected XRandR monitor geometry and `picture-options=spanned`; this still needs verification on actual GNOME X11/Wayland sessions. XFCE currently targets the first monitor/workspace. Live compositor rendering, performance presets, historical statistics, and separate per-monitor images are not implemented. CPU smoothing state is held in daemon memory and starts fresh after a daemon restart.
+The GTK dashboard provides live process/CPU/memory summaries, a top-process list, service controls, theme/mode/interval selection, sizing and smoothing controls, process-name search/exclusions/pinning, user-only and process-group filters, thresholds, font/colors, and output dimensions. GNOME spanning uses detected XRandR monitor geometry and `picture-options=spanned`; this still needs verification on actual GNOME X11/Wayland sessions. XFCE applies the same generated image to each configured monitor/workspace. Live compositor rendering, performance presets, historical statistics, and separate per-monitor images are not implemented. CPU smoothing state is held in daemon memory and starts fresh after a daemon restart.
+
+## Building release packages
+
+The **Linux packages** GitHub Actions workflow runs tests and builds packages in separate Fedora 44 and Debian 13 containers. It also runs on pull requests and supports manual runs, where packages are available as workflow artifacts.
+
+To create a public download, a maintainer should:
+
+1. Set the version in `Cargo.toml` and update `Cargo.lock`.
+2. Push a matching tag, such as `v0.1.0`.
+3. Wait for both native package jobs to finish, review the draft GitHub release, and publish it.
+
+The workflow attaches the RPM, DEB, and a combined `SHA256SUMS` file to the draft. It does not publish releases automatically. Set `PACKAGE_MAINTAINER` to your package contact when building locally; otherwise metadata uses “ProcScape contributors.”
+
+To build locally on the matching distribution (Python 3.11+ required):
+
+```sh
+python3 packaging/fetch-nfpm.py /tmp/procscape-tools
+NFPM=/tmp/procscape-tools/nfpm python3 packaging/build-packages.py --format rpm
+# On Debian 13, use --format deb instead.
+```
+
+The builder uses an isolated `target/packages` directory and remaps checkout, home, Cargo, and Rustup paths to neutral `/build/...` prefixes in release binaries. Before packaging, it checks both executables for personal home paths and known build-machine prefixes. `--skip-build` reuses only these package-build binaries and still performs the privacy check.
+
+The builder refuses to label a Fedora binary as a Debian package or vice versa. Packages contain `/usr/bin/procscape`, `/usr/bin/procscape-gui`, the desktop launcher, and a system-wide user service. They keep settings in the user's XDG directories.
 
 ## Development and checks
 
 ```sh
 cargo test
+python3 -m unittest discover -s tests -p 'test_*.py'
 cargo run -- snapshot --output /tmp/procscape.png
 ```
 

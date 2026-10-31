@@ -31,6 +31,22 @@ pub struct ServiceStatus {
     pub collected_at: u64,
     pub render_ms: u128,
 }
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct RefreshError {
+    pub occurred_at: u64,
+    pub message: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ServiceReport {
+    pub state: String,
+    pub pid: Option<i32>,
+    pub last_success: Option<ServiceStatus>,
+    pub last_error: Option<RefreshError>,
+    #[serde(default)]
+    pub active_wallpaper: Option<std::path::PathBuf>,
+}
+
 #[derive(Default)]
 pub struct Sampler {
     previous_total: u64,

@@ -25,6 +25,8 @@ pub struct LayoutMemory {
     pub width: u32,
     pub height: u32,
     pub positions: HashMap<String, (f32, f32, bool)>,
+    #[serde(default)]
+    pub font_sizes: HashMap<String, f32>,
 }
 
 pub fn place(
@@ -41,79 +43,118 @@ pub fn place(
     let gh = (height + cell - 1) / cell;
     let mut mask = vec![0u8; (gw * gh) as usize];
     let mut out = HashMap::new();
+    let stability = stability.clamp(0.0, 0.95);
     let mut order: Vec<&Item> = items.iter().collect();
-    order.sort_by_key(|i| std::cmp::Reverse(i.width.max(i.height)));
+    order.sort_by(|a, b| {
+        b.width
+            .max(b.height)
+            .cmp(&a.width.max(a.height))
+            .then_with(|| a.key.cmp(&b.key))
+    });
+    // Reserve legal anchors first. A newly enlarged word must not push every
+    // unchanged word away merely because it is sorted first this time.
+    if stability > 0.0 {
+        for item in &order {
+            let Some(&(cx, cy, _)) = memory.positions.get(&item.key) else {
+                continue;
+            };
+            let (w, h) = dimensions(item);
+            let x = (cx * width as f32 - w as f32 / 2.0).round() as i32;
+            let y = (cy * height as f32 - h as f32 / 2.0).round() as i32;
+            if let Some(rect) = bounded_rect(x, y, w, h, width, height, margin) {
+                if clear(&mask, gw, gh, rect, padding, cell) {
+                    mark(&mut mask, gw, gh, rect, padding, cell);
+                    out.insert(
+                        item.key.clone(),
+                        Placement {
+                            rect,
+                            rotated: item.rotated,
+                        },
+                    );
+                }
+            }
+        }
+    }
     for item in order {
-        let (w, h) = if item.rotated {
-            (item.height, item.width)
-        } else {
-            (item.width, item.height)
-        };
-        if w + 2 * margin > width || h + 2 * margin > height {
+        if out.contains_key(&item.key) {
             continue;
         }
-        let old = memory.positions.get(&item.key).copied();
+        let (w, h) = dimensions(item);
+        if w.saturating_add(2 * margin) > width || h.saturating_add(2 * margin) > height {
+            continue;
+        }
+        let old = if stability > 0.0 {
+            memory.positions.get(&item.key).copied()
+        } else {
+            None
+        };
         let center = old
-            .map(|(x, y, _)| ((x * width as f32) as i32, (y * height as f32) as i32))
-            .unwrap_or((width as i32 / 2, height as i32 / 2));
-        let mut found = None;
-        // Fermat spiral with the last location as its origin keeps retained words visually calm.
-        let golden = 2.399963f32;
-        let step = cell as f32 * 1.4;
-        let tries = 24000usize;
-        for n in 0..tries {
-            let (cx, cy) = if n == 0 {
-                center
+            .map(|(x, y, _)| (x * width as f32, y * height as f32))
+            .unwrap_or((width as f32 / 2.0, height as f32 / 2.0));
+        // Search around the old center, subtracting half the dimensions only
+        // once. Higher stability searches nearby positions more finely.
+        let step = cell as f32
+            * 1.4
+            * if old.is_some() {
+                1.0 - stability * 0.5
             } else {
-                let r = step * (n as f32).sqrt();
-                let a = n as f32 * golden;
-                (
-                    (center.0 as f32 + r * a.cos()) as i32,
-                    (center.1 as f32 + r * a.sin()) as i32,
-                )
+                1.0
             };
-            let mut x = cx - w as i32 / 2;
-            let mut y = cy - h as i32 / 2;
-            if let Some((ox, oy, _)) = old {
-                let stability = stability.clamp(0.0, 0.95);
-                let acx = x as f32;
-                let acy = y as f32;
-                x = (acx * (1.0 - stability) + ox * width as f32 * stability - w as f32 / 2.0)
-                    as i32;
-                y = (acy * (1.0 - stability) + oy * height as f32 * stability - h as f32 / 2.0)
-                    as i32;
-            }
-            if x < margin as i32
-                || y < margin as i32
-                || x + w as i32 + margin as i32 > width as i32
-                || y + h as i32 + margin as i32 > height as i32
-            {
+        for n in 0..24000usize {
+            let radius = step * (n as f32).sqrt();
+            let angle = n as f32 * 2.399963f32;
+            let x = (center.0 + radius * angle.cos() - w as f32 / 2.0).round() as i32;
+            let y = (center.1 + radius * angle.sin() - h as f32 / 2.0).round() as i32;
+            let Some(rect) = bounded_rect(x, y, w, h, width, height, margin) else {
                 continue;
-            }
-            let rect = BoxRect {
-                x: x as u32,
-                y: y as u32,
-                w,
-                h,
             };
             if clear(&mask, gw, gh, rect, padding, cell) {
                 mark(&mut mask, gw, gh, rect, padding, cell);
-                found = Some(rect);
+                out.insert(
+                    item.key.clone(),
+                    Placement {
+                        rect,
+                        rotated: item.rotated,
+                    },
+                );
                 break;
             }
-        }
-        if let Some(rect) = found {
-            out.insert(
-                item.key.clone(),
-                Placement {
-                    rect,
-                    rotated: item.rotated,
-                },
-            );
         }
     }
     out
 }
+fn dimensions(item: &Item) -> (u32, u32) {
+    if item.rotated {
+        (item.height, item.width)
+    } else {
+        (item.width, item.height)
+    }
+}
+
+fn bounded_rect(
+    x: i32,
+    y: i32,
+    w: u32,
+    h: u32,
+    width: u32,
+    height: u32,
+    margin: u32,
+) -> Option<BoxRect> {
+    if x < margin as i32
+        || y < margin as i32
+        || x as i64 + w as i64 + margin as i64 > width as i64
+        || y as i64 + h as i64 + margin as i64 > height as i64
+    {
+        return None;
+    }
+    Some(BoxRect {
+        x: x as u32,
+        y: y as u32,
+        w,
+        h,
+    })
+}
+
 fn cells(r: BoxRect, p: u32, c: u32, gw: u32, gh: u32) -> (u32, u32, u32, u32) {
     let x0 = r.x.saturating_sub(p) / c;
     let y0 = r.y.saturating_sub(p) / c;
@@ -137,6 +178,72 @@ fn mark(m: &mut [u8], gw: u32, gh: u32, r: BoxRect, p: u32, c: u32) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn unchanged_odd_sized_words_do_not_drift_across_refreshes() {
+        let items = (0..20)
+            .map(|i| Item {
+                key: format!("worker-{i}"),
+                width: 47,
+                height: 23,
+                rotated: i % 5 == 0,
+            })
+            .collect::<Vec<_>>();
+        let mut memory = LayoutMemory::default();
+        let initial = place(&items, 800, 450, 12, 3, &memory, 0.72);
+        assert_eq!(initial.len(), items.len());
+        for _ in 0..20 {
+            memory.positions = initial
+                .iter()
+                .map(|(key, p)| {
+                    (
+                        key.clone(),
+                        (
+                            (p.rect.x as f32 + p.rect.w as f32 / 2.0) / 800.0,
+                            (p.rect.y as f32 + p.rect.h as f32 / 2.0) / 450.0,
+                            p.rotated,
+                        ),
+                    )
+                })
+                .collect();
+            let next = place(&items, 800, 450, 12, 3, &memory, 0.72);
+            for (key, old) in &initial {
+                let new = &next[key];
+                assert_eq!(
+                    (new.rect.x, new.rect.y, new.rotated),
+                    (old.rect.x, old.rect.y, old.rotated)
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn new_large_word_does_not_displace_legal_existing_anchor() {
+        let memory = LayoutMemory {
+            positions: HashMap::from([("existing".into(), (0.5, 0.5, false))]),
+            ..Default::default()
+        };
+        let items = [
+            Item {
+                key: "new".into(),
+                width: 250,
+                height: 70,
+                rotated: false,
+            },
+            Item {
+                key: "existing".into(),
+                width: 50,
+                height: 20,
+                rotated: false,
+            },
+        ];
+        let placed = place(&items, 800, 450, 12, 3, &memory, 0.72);
+        assert_eq!(
+            (placed["existing"].rect.x, placed["existing"].rect.y),
+            (375, 215)
+        );
+        assert!(placed.contains_key("new"));
+    }
+
     #[test]
     fn placement_is_in_bounds_and_collision_free() {
         let items = (0..30)
@@ -200,6 +307,7 @@ mod tests {
             width: 800,
             height: 450,
             positions: HashMap::from([("gone".into(), (0.5, 0.5, false))]),
+            ..LayoutMemory::default()
         };
         let items = [
             Item {

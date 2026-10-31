@@ -1,6 +1,8 @@
 mode = "hybrid"
 theme = "catppuccin-mocha"
 refresh_seconds = 15
+# Fade between refreshes; 0 disables fading.
+transition_ms = 600
 width = 0
 height = 0
 span_monitors = true

@@ -2,7 +2,13 @@ use gtk4::{
     Application, ApplicationWindow, Box as GtkBox, Button, CheckButton, DropDown, Entry, Grid,
     Label, Orientation, Picture, ScrolledWindow, Separator, SpinButton, prelude::*,
 };
-use std::{fs, path::PathBuf, process::Command};
+use std::{
+    cell::{Cell, RefCell},
+    fs,
+    path::PathBuf,
+    process::Command,
+    rc::Rc,
+};
 
 type Config = procscape::config::Config;
 
@@ -21,24 +27,195 @@ fn config_path() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from(".config"))
         .join("procscape/config.toml")
 }
-fn data_path() -> PathBuf {
-    std::env::var_os("XDG_DATA_HOME")
-        .map(PathBuf::from)
-        .or_else(dirs::data_dir)
-        .unwrap_or_else(|| PathBuf::from(".local/share"))
-        .join("procscape")
-}
 fn binary() -> PathBuf {
     std::env::current_exe()
         .unwrap_or_else(|_| PathBuf::from("procscape-gui"))
         .with_file_name("procscape")
 }
-fn invoke(args: &[&str]) -> String {
-    Command::new(binary())
+fn invoke(args: &[&str]) -> Result<String, String> {
+    let output = Command::new(binary())
         .args(args)
         .output()
-        .map(|x| String::from_utf8_lossy(&x.stdout).to_string())
-        .unwrap_or_else(|e| format!("Could not run ProcScape: {e}"))
+        .map_err(|e| format!("Could not run ProcScape: {e}"))?;
+    command_result(output)
+}
+
+fn command_result(output: std::process::Output) -> Result<String, String> {
+    if output.status.success() {
+        Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+    } else {
+        let detail = String::from_utf8_lossy(&output.stderr);
+        Err(format!(
+            "ProcScape failed ({}): {}",
+            output.status,
+            detail.trim()
+        ))
+    }
+}
+
+async fn background<T: Send + 'static>(
+    job: impl FnOnce() -> Result<T, String> + Send + 'static,
+) -> Result<T, String> {
+    gtk4::gio::spawn_blocking(job)
+        .await
+        .unwrap_or_else(|_| Err("Background task failed.".into()))
+}
+
+fn run_action(
+    status: Label,
+    controls: Vec<Button>,
+    job: impl FnOnce() -> Result<String, String> + Send + 'static,
+) {
+    status.set_text("Working…");
+    for button in &controls {
+        button.set_sensitive(false);
+    }
+    gtk4::glib::MainContext::default().spawn_local(async move {
+        let result = background(job).await;
+        status.set_text(&result.unwrap_or_else(|error| error));
+        for button in controls {
+            button.set_sensitive(true);
+        }
+    });
+}
+
+fn local_time(timestamp: u64) -> String {
+    i64::try_from(timestamp)
+        .ok()
+        .and_then(|t| gtk4::glib::DateTime::from_unix_local(t).ok())
+        .and_then(|date| date.format("%d %b %Y, %H:%M:%S").ok())
+        .map(|text| text.to_string())
+        .unwrap_or_else(|| "Unknown time".into())
+}
+
+fn service_summary(report: &procscape::monitor::ServiceReport) -> (String, String, String) {
+    let last = report
+        .last_success
+        .as_ref()
+        .map(|info| local_time(info.collected_at))
+        .unwrap_or_else(|| "No successful update yet".into());
+    let error = report
+        .last_error
+        .as_ref()
+        .map(|error| {
+            format!(
+                "Last error ({}): {}",
+                local_time(error.occurred_at),
+                error.message
+            )
+        })
+        .unwrap_or_default();
+    (
+        format!("Service: {}", report.state),
+        format!("Last successful update: {last}"),
+        error,
+    )
+}
+
+fn update_service_labels(
+    state: Label,
+    updated: Label,
+    error: Label,
+    picture: Picture,
+    caption: Label,
+    current_image: Rc<RefCell<Option<PathBuf>>>,
+    pending: Rc<Cell<bool>>,
+) {
+    if pending.replace(true) {
+        return;
+    }
+    gtk4::glib::MainContext::default().spawn_local(async move {
+        let result = background(|| {
+            invoke(&["status", "--json"]).and_then(|raw| {
+                serde_json::from_str::<procscape::monitor::ServiceReport>(&raw)
+                    .map_err(|e| e.to_string())
+            })
+        })
+        .await;
+        match result {
+            Ok(report) => {
+                let (state_text, update_text, error_text) = service_summary(&report);
+                state.set_text(&state_text);
+                updated.set_text(&update_text);
+                error.set_text(&error_text);
+                error.set_visible(!error_text.is_empty());
+                // Only show the exact image acknowledged as applied by the daemon.
+                // Restore clears this field; opening the dashboard never renders.
+                if *current_image.borrow() != report.active_wallpaper {
+                    picture.set_filename(report.active_wallpaper.as_deref());
+                    *current_image.borrow_mut() = report.active_wallpaper.clone();
+                }
+                caption.set_text(if report.active_wallpaper.is_some() {
+                    "Last applied ProcScape wallpaper"
+                } else {
+                    "No ProcScape wallpaper is active."
+                });
+            }
+            Err(message) => {
+                state.set_text("Service: Unable to read status");
+                updated.set_text("Last successful update: Unavailable");
+                error.set_text(&message);
+                error.set_visible(true);
+            }
+        }
+        pending.set(false);
+    });
+}
+
+fn update_metrics(
+    count: Label,
+    cpu: Label,
+    memory: Label,
+    mode: Label,
+    list: Label,
+    pending: Rc<Cell<bool>>,
+) {
+    if pending.replace(true) {
+        return;
+    }
+    gtk4::glib::MainContext::default().spawn_local(async move {
+        let result = background(|| {
+            let raw = invoke(&["metrics"])?;
+            let snapshot = serde_json::from_str::<procscape::monitor::Snapshot>(&raw)
+                .map_err(|e| e.to_string())?;
+            Ok((snapshot, mode_name()))
+        })
+        .await;
+        match result {
+            Ok((snapshot, mode_name)) => {
+                count.set_text(&format!("Processes: {}", snapshot.processes.len()));
+                cpu.set_text(&format!("CPU: {:.1}%", snapshot.cpu_percent));
+                memory.set_text(&format!("Memory: {:.1}%", snapshot.memory_percent));
+                mode.set_text(&format!("Mode: {mode_name}"));
+                let mut processes = snapshot.processes;
+                processes.sort_by(|a, b| {
+                    b.weight
+                        .total_cmp(&a.weight)
+                        .then_with(|| a.name.cmp(&b.name))
+                });
+                let text = processes
+                    .iter()
+                    .take(24)
+                    .map(|p| {
+                        format!(
+                            "{} · {:.0}% CPU · {:.1} MiB",
+                            p.name,
+                            p.cpu_percent,
+                            p.rss_kib as f32 / 1024.0
+                        )
+                    })
+                    .collect::<Vec<_>>()
+                    .join("    •    ");
+                list.set_text(if text.is_empty() {
+                    "No matching processes"
+                } else {
+                    &text
+                });
+            }
+            Err(message) => list.set_text(&format!("Metrics unavailable: {message}")),
+        }
+        pending.set(false);
+    });
 }
 
 struct SettingsWidgets {
@@ -56,6 +233,7 @@ struct SettingsWidgets {
     cpu_weight: SpinButton,
     memory_weight: SpinButton,
     smoothing: SpinButton,
+    fade: SpinButton,
     stability: SpinButton,
     min_cpu: SpinButton,
     min_memory: SpinButton,
@@ -91,8 +269,19 @@ fn build(app: &Application) {
         "Ready · live metrics update while this window is open",
     ));
     status.set_xalign(0.0);
+    status.set_wrap(true);
     root.append(&status);
 
+    let service_state = Label::new(None);
+    let last_update = Label::new(None);
+    let service_error = Label::new(None);
+    service_error.add_css_class("error");
+    for label in [&service_state, &last_update, &service_error] {
+        label.set_xalign(0.0);
+        label.set_wrap(true);
+        label.set_selectable(true);
+        root.append(label);
+    }
     let stats = GtkBox::new(Orientation::Horizontal, 18);
     let processes_metric = Label::new(Some("Processes: —"));
     let cpu_metric = Label::new(Some("CPU: —"));
@@ -107,17 +296,10 @@ fn build(app: &Application) {
     let preview = Picture::new();
     preview.set_size_request(740, 390);
     preview.set_can_shrink(true);
-    let _ = fs::create_dir_all(data_path());
-    let image = data_path().join("wallpaper.png");
-    let active_image = fs::read_to_string(data_path().join("active-wallpaper.txt"))
-        .ok()
-        .map(PathBuf::from)
-        .filter(|path| path.exists())
-        .unwrap_or_else(|| image.clone());
-    if active_image.exists() {
-        preview.set_filename(Some(active_image.as_path()));
-    }
     root.append(&preview);
+    let preview_caption = Label::new(Some("Loading applied wallpaper…"));
+    preview_caption.add_css_class("dim-label");
+    root.append(&preview_caption);
 
     let process_list = Label::new(Some("Waiting for process metrics…"));
     process_list.set_xalign(0.0);
@@ -129,29 +311,11 @@ fn build(app: &Application) {
     let start = Button::with_label("Start / resume");
     let pause = Button::with_label("Pause");
     let refresh = Button::with_label("Refresh now");
-    let restore = Button::with_label("Restore previous wallpaper");
+    let restore = Button::with_label("Restore my wallpaper");
     for button in [&start, &pause, &refresh, &restore] {
         actions.append(button);
     }
     root.append(&actions);
-
-    let result = status.clone();
-    start.connect_clicked(move |_| result.set_text(&invoke(&["start"])));
-    let result = status.clone();
-    pause.connect_clicked(move |_| result.set_text(&invoke(&["pause"])));
-    let result = status.clone();
-    let picture = preview.clone();
-    let refresh_image = image.clone();
-    refresh.connect_clicked(move |_| {
-        let _ = invoke(&["refresh"]);
-        let _ = invoke(&["snapshot"]);
-        if refresh_image.exists() {
-            picture.set_filename(Some(refresh_image.as_path()));
-        }
-        result.set_text("Wallpaper refreshed. Process metrics continue to update below.");
-    });
-    let result = status.clone();
-    restore.connect_clicked(move |_| result.set_text(&invoke(&["restore"])));
 
     root.append(&Separator::new(Orientation::Horizontal));
     let heading = Label::new(Some("Appearance and process filtering"));
@@ -315,6 +479,16 @@ fn build(app: &Application) {
         500.0,
         4.0,
     );
+    add_spin(
+        &grid,
+        0,
+        8,
+        "Refresh fade (seconds; 0 = off)",
+        &settings.fade,
+        0.0,
+        2.0,
+        0.1,
+    );
     root.append(&grid);
 
     add_entry(&root, "Search process names", &settings.search);
@@ -350,25 +524,47 @@ fn build(app: &Application) {
     root.append(&toggles);
 
     let apply = Button::with_label("Save settings and refresh");
+    let controls = vec![
+        start.clone(),
+        pause.clone(),
+        refresh.clone(),
+        restore.clone(),
+        apply.clone(),
+    ];
+    for (button, command) in [
+        (&start, "start"),
+        (&pause, "pause"),
+        (&refresh, "refresh"),
+        (&restore, "restore"),
+    ] {
+        let status = status.clone();
+        let controls = controls.clone();
+        button.connect_clicked(move |_| {
+            run_action(status.clone(), controls.clone(), move || invoke(&[command]));
+        });
+    }
     let result = status.clone();
-    let picture = preview.clone();
-    let preview_image = image.clone();
-    apply.connect_clicked(move |_| match save_settings(&settings) {
-        Ok(()) => {
-            let _ = invoke(&["refresh"]);
-            let _ = invoke(&["snapshot"]);
-            if preview_image.exists() {
-                picture.set_filename(Some(preview_image.as_path()));
-            }
-            result.set_text("Settings saved. Wallpaper refresh requested.");
+    apply.connect_clicked(move |_| {
+        if !settings.start_login.is_sensitive() {
+            result.set_text("Loading service settings. Try again shortly.");
+            return;
         }
-        Err(error) => result.set_text(&format!("Settings could not be saved: {error}")),
+        let cfg = settings_config(&settings);
+        let start_login = settings.start_login.is_active();
+        run_action(result.clone(), controls.clone(), move || {
+            save_settings(cfg, start_login).map_err(|e| e.to_string())?;
+            match invoke(&["refresh"]) {
+                Ok(message) => Ok(format!("Settings saved. {message}")),
+                Err(error) => Err(format!("Settings saved. {error}")),
+            }
+        });
     });
     root.append(&apply);
     let note = Label::new(Some(
-        "Wallpaper updates continue after closing this window. Desktop wallpaper application needs a supported GNOME or XFCE session.",
+        "Restore my wallpaper pauses updates until Start / resume, even after restarting. Change your personal wallpaper while paused; ProcScape remembers it the next time updates run. Closing this window keeps the current service state.",
     ));
     note.set_xalign(0.0);
+    note.set_wrap(true);
     note.add_css_class("dim-label");
     root.append(&note);
 
@@ -382,43 +578,46 @@ fn build(app: &Application) {
         .build();
     win.present();
 
-    let process_label = process_list.clone();
-    let process_count = processes_metric.clone();
-    let cpu_value = cpu_metric.clone();
-    let memory_value = memory_metric.clone();
-    let mode_value = mode_metric.clone();
-    gtk4::glib::timeout_add_seconds_local(5, move || {
-        let raw = invoke(&["metrics"]);
-        if let Ok(snapshot) = serde_json::from_str::<procscape::monitor::Snapshot>(&raw) {
-            process_count.set_text(&format!("Processes: {}", snapshot.processes.len()));
-            cpu_value.set_text(&format!("CPU: {:.1}%", snapshot.cpu_percent));
-            memory_value.set_text(&format!("Memory: {:.1}%", snapshot.memory_percent));
-            let mut processes = snapshot.processes;
-            processes.sort_by(|a, b| {
-                b.weight
-                    .total_cmp(&a.weight)
-                    .then_with(|| a.name.cmp(&b.name))
-            });
-            let text = processes
-                .iter()
-                .take(24)
-                .map(|p| {
-                    format!(
-                        "{} · {:.0}% CPU · {:.1} MiB",
-                        p.name,
-                        p.cpu_percent,
-                        p.rss_kib as f32 / 1024.0
-                    )
-                })
-                .collect::<Vec<_>>()
-                .join("    •    ");
-            process_label.set_text(if text.is_empty() {
-                "No matching processes"
-            } else {
-                &text
-            });
-            mode_value.set_text(&format!("Mode: {}", mode_name()));
+    let status_pending = Rc::new(Cell::new(false));
+    let current_image = Rc::new(RefCell::new(None));
+    let poll_status = move || {
+        update_service_labels(
+            service_state.clone(),
+            last_update.clone(),
+            service_error.clone(),
+            preview.clone(),
+            preview_caption.clone(),
+            current_image.clone(),
+            status_pending.clone(),
+        )
+    };
+    poll_status();
+    let weak_window = win.downgrade();
+    gtk4::glib::timeout_add_seconds_local(1, move || {
+        if weak_window.upgrade().is_none() {
+            return gtk4::glib::ControlFlow::Break;
         }
+        poll_status();
+        gtk4::glib::ControlFlow::Continue
+    });
+    let metrics_pending = Rc::new(Cell::new(false));
+    let poll_metrics = move || {
+        update_metrics(
+            processes_metric.clone(),
+            cpu_metric.clone(),
+            memory_metric.clone(),
+            mode_metric.clone(),
+            process_list.clone(),
+            metrics_pending.clone(),
+        )
+    };
+    poll_metrics();
+    let weak_window = win.downgrade();
+    gtk4::glib::timeout_add_seconds_local(5, move || {
+        if weak_window.upgrade().is_none() {
+            return gtk4::glib::ControlFlow::Break;
+        }
+        poll_metrics();
         gtk4::glib::ControlFlow::Continue
     });
 }
@@ -452,6 +651,7 @@ fn settings_widgets() -> SettingsWidgets {
     let cpu_weight = spin(0.65, 0.0, 1.0, 0.05);
     let memory_weight = spin(0.35, 0.0, 1.0, 0.05);
     let smoothing = spin(0.35, 0.01, 1.0, 0.05);
+    let fade = spin(0.6, 0.0, 2.0, 0.1);
     let stability = spin(0.72, 0.0, 0.95, 0.05);
     let min_cpu = spin(0.0, 0.0, 10000.0, 0.5);
     let min_memory = spin(0.0, 0.0, 1_000_000_000.0, 1024.0);
@@ -484,6 +684,7 @@ fn settings_widgets() -> SettingsWidgets {
         cpu_weight,
         memory_weight,
         smoothing,
+        fade,
         stability,
         min_cpu,
         min_memory,
@@ -545,6 +746,7 @@ fn load_settings(w: &SettingsWidgets) {
         (&w.cpu_weight, cfg.cpu_weight as f64),
         (&w.memory_weight, cfg.memory_weight as f64),
         (&w.smoothing, cfg.smoothing as f64),
+        (&w.fade, cfg.transition_ms as f64 / 1000.0),
         (&w.stability, cfg.layout_stability as f64),
         (&w.min_cpu, cfg.min_cpu_percent as f64),
         (&w.min_memory, cfg.min_memory_kib as f64),
@@ -564,19 +766,25 @@ fn load_settings(w: &SettingsWidgets) {
     w.exclude_kernel.set_active(cfg.exclude_kernel_threads);
     w.exclude_zombies.set_active(cfg.exclude_zombies);
     w.span_monitors.set_active(cfg.span_monitors);
-    let enabled = Command::new("systemctl")
-        .args(["--user", "is-enabled", "procscape.service"])
-        .output()
-        .map(|o| o.status.success())
+    let start_login = w.start_login.clone();
+    start_login.set_sensitive(false);
+    gtk4::glib::MainContext::default().spawn_local(async move {
+        let enabled = background(|| {
+            Ok(Command::new("systemctl")
+                .args(["--user", "is-enabled", "procscape.service"])
+                .output()
+                .map(|o| o.status.success())
+                .unwrap_or(false))
+        })
+        .await
         .unwrap_or(false);
-    w.start_login.set_active(enabled);
+        start_login.set_active(enabled);
+        start_login.set_sensitive(true);
+    });
 }
 
-fn save_settings(w: &SettingsWidgets) -> Result<(), Box<dyn std::error::Error>> {
+fn settings_config(w: &SettingsWidgets) -> Config {
     let path = config_path();
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)?;
-    }
     let mut cfg = fs::read_to_string(&path)
         .ok()
         .and_then(|s| toml::from_str::<Config>(&s).ok())
@@ -614,6 +822,7 @@ fn save_settings(w: &SettingsWidgets) -> Result<(), Box<dyn std::error::Error>> 
     cfg.cpu_weight = w.cpu_weight.value() as f32;
     cfg.memory_weight = w.memory_weight.value() as f32;
     cfg.smoothing = w.smoothing.value() as f32;
+    cfg.transition_ms = (w.fade.value() * 1000.0).round() as u64;
     cfg.layout_stability = w.stability.value() as f32;
     cfg.min_cpu_percent = w.min_cpu.value() as f32;
     cfg.min_memory_kib = w.min_memory.value_as_int().max(0) as u64;
@@ -632,18 +841,22 @@ fn save_settings(w: &SettingsWidgets) -> Result<(), Box<dyn std::error::Error>> 
     cfg.exclude_zombies = w.exclude_zombies.is_active();
     cfg.span_monitors = w.span_monitors.is_active();
     cfg.sanitize();
-    fs::write(path, toml::to_string_pretty(&cfg)?)?;
+    cfg
+}
+
+fn save_settings(cfg: Config, start_login: bool) -> Result<(), Box<dyn std::error::Error>> {
+    let path = config_path();
+    fs::create_dir_all(path.parent().unwrap())?;
+    let temporary = path.with_extension("toml.tmp");
+    fs::write(&temporary, toml::to_string_pretty(&cfg)?)?;
+    fs::rename(temporary, path)?;
     let currently_enabled = Command::new("systemctl")
         .args(["--user", "is-enabled", "procscape.service"])
         .output()
         .map(|o| o.status.success())
         .unwrap_or(false);
-    if currently_enabled != w.start_login.is_active() {
-        let action = if w.start_login.is_active() {
-            "enable"
-        } else {
-            "disable"
-        };
+    if currently_enabled != start_login {
+        let action = if start_login { "enable" } else { "disable" };
         let result = Command::new("systemctl")
             .args(["--user", action, "procscape.service"])
             .output()?;
@@ -701,3 +914,76 @@ fn mode_name() -> String {
         .unwrap_or_else(|| "Hybrid".into())
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::os::unix::process::ExitStatusExt;
+
+    #[test]
+    fn service_summary_shows_state_update_and_error_independently() {
+        let mut report = procscape::monitor::ServiceReport {
+            state: "Paused".into(),
+            pid: Some(42),
+            last_success: None,
+            last_error: None,
+            active_wallpaper: None,
+        };
+        let (state, update, error) = service_summary(&report);
+        assert_eq!(state, "Service: Paused");
+        assert!(update.contains("No successful update yet"));
+        assert!(error.is_empty());
+        report.last_success = Some(procscape::monitor::ServiceStatus {
+            collected_at: 1_793_375_909,
+            ..Default::default()
+        });
+        report.last_error = Some(procscape::monitor::RefreshError {
+            occurred_at: 1_793_375_910,
+            message: "Desktop unavailable".into(),
+        });
+        let (_, update, error) = service_summary(&report);
+        assert!(!update.contains("No successful update"));
+        assert!(error.contains("Desktop unavailable"));
+    }
+
+    #[test]
+    fn background_work_keeps_main_context_available() {
+        use std::sync::{
+            Arc,
+            atomic::{AtomicBool, Ordering},
+        };
+        let context = gtk4::glib::MainContext::new();
+        context
+            .with_thread_default(|| {
+                context.block_on(async {
+                    let finished = Arc::new(AtomicBool::new(false));
+                    let flag = finished.clone();
+                    let (release, wait) = std::sync::mpsc::channel();
+                    let job = background(move || {
+                        wait.recv_timeout(std::time::Duration::from_secs(5))
+                            .map_err(|e| e.to_string())?;
+                        flag.store(true, Ordering::SeqCst);
+                        Ok("done")
+                    });
+                    // The main-loop timer must be able to release a blocked worker.
+                    let task = context.spawn_local(job);
+                    gtk4::glib::timeout_future(std::time::Duration::from_millis(15)).await;
+                    assert!(!finished.load(Ordering::SeqCst));
+                    release.send(()).unwrap();
+                    assert_eq!(task.await.unwrap().unwrap(), "done");
+                })
+            })
+            .unwrap();
+    }
+
+    #[test]
+    fn failed_commands_show_stderr() {
+        let output = std::process::Output {
+            status: std::process::ExitStatus::from_raw(1 << 8),
+            stdout: Vec::new(),
+            stderr: b"Error: reading font /missing/font.ttf\n".to_vec(),
+        };
+        let error = command_result(output).unwrap_err();
+        assert!(error.contains("reading font /missing/font.ttf"));
+        assert!(error.contains("exit status: 1"));
+    }
+}

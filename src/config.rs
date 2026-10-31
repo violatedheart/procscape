@@ -1,5 +1,7 @@
 use serde::{Deserialize, Serialize};
 
+pub const DEFAULT_FONT_PATH: &str = "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf";
+
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "kebab-case")]
 pub enum RunMode {
@@ -19,6 +21,7 @@ pub struct Config {
     pub mode: RunMode,
     pub theme: String,
     pub refresh_seconds: u64,
+    pub transition_ms: u64,
     pub width: u32,
     pub height: u32,
     pub span_monitors: bool,
@@ -53,6 +56,7 @@ impl Default for Config {
             mode: RunMode::Hybrid,
             theme: "catppuccin-mocha".into(),
             refresh_seconds: 15,
+            transition_ms: 600,
             width: 0,
             height: 0,
             span_monitors: true,
@@ -76,7 +80,7 @@ impl Default for Config {
             min_cpu_percent: 0.0,
             min_memory_kib: 0,
             exclude_patterns: Vec::new(),
-            font_path: "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf".into(),
+            font_path: DEFAULT_FONT_PATH.into(),
             margins: 24,
             custom_background: "#11111b".into(),
             custom_palette: vec!["#f38ba8".into(), "#a6e3a1".into(), "#89b4fa".into()],
@@ -86,6 +90,7 @@ impl Default for Config {
 impl Config {
     pub fn sanitize(&mut self) {
         self.refresh_seconds = self.refresh_seconds.clamp(5, 3600);
+        self.transition_ms = self.transition_ms.min(2000);
         self.width = self.width.min(7680);
         self.height = self.height.min(4320);
         self.max_words = self.max_words.clamp(1, 1000);

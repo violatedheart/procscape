@@ -34,3 +34,23 @@ fn live_proc_snapshot_renders_a_valid_png() {
             .unwrap();
     assert!(info["placed"].as_u64().unwrap() > 0);
 }
+
+#[test]
+fn identical_snapshot_renders_identical_pixels_after_loading_layout_memory() {
+    let temp = tempfile::tempdir().unwrap();
+    let cfg = Config {
+        width: 800,
+        height: 450,
+        ..Config::default()
+    };
+    let snapshot = collect_snapshot(&cfg, None).unwrap();
+    let state = temp.path().join("state/layout.json");
+    let first = temp.path().join("first.png");
+    let second = temp.path().join("second.png");
+    render::generate(&snapshot, &cfg, &first, &state).unwrap();
+    render::generate(&snapshot, &cfg, &second, &state).unwrap();
+    assert_eq!(
+        image::open(first).unwrap().to_rgba8(),
+        image::open(second).unwrap().to_rgba8()
+    );
+}

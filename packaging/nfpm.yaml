@@ -1,0 +1,41 @@
+name: procscape
+arch: amd64
+platform: linux
+version: ${PROC_VERSION}
+maintainer: ${PACKAGE_MAINTAINER}
+description: A Linux process word-cloud wallpaper with a GTK dashboard.
+homepage: https://github.com/violatedheart/procscape
+license: MIT
+section: graphics
+priority: optional
+contents:
+  - src: target/packages/release/procscape
+    dst: /usr/bin/procscape
+  - src: target/packages/release/procscape-gui
+    dst: /usr/bin/procscape-gui
+  - src: packaging/procscape.desktop
+    dst: /usr/share/applications/procscape.desktop
+  - src: packaging/procscape-system.service
+    dst: /usr/lib/systemd/user/procscape.service
+  - src: LICENSE
+    dst: /usr/share/licenses/procscape/LICENSE
+  - src: README.md
+    dst: /usr/share/doc/procscape/README.md
+scripts:
+  postinstall: packaging/package-installed.sh
+  postremove: packaging/package-installed.sh
+overrides:
+  rpm:
+    depends:
+      - gtk4 >= 4.6
+      - glibc >= 2.43
+      - libgcc
+      - dejavu-sans-fonts
+      - systemd
+  deb:
+    depends:
+      - libgtk-4-1 (>= 4.6)
+      - libc6 (>= 2.41)
+      - libgcc-s1
+      - fonts-dejavu-core
+      - systemd
